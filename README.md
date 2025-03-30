@@ -52,8 +52,6 @@ VGG16을 본 연구의 사전 훈련 모델로 선택한 이유는 우선 이미
 
 ResNet50은 2015년 마이크로소프트 연구진에 의해 개발된 모델로, 기존 CNN 모델의 깊이가 깊어질수록 성능이 오히려 저하되는 문제인 기울기 소실(Vanishing Gradient) 문제를 해결하기 위해 잔차 학습(Residual Learning) 방식을 도입하였다. ResNet은 입력 신호를 출력 신호에 직접 연결하는 스킵 연결(skip connection)을 활용하여, 네트워크가 더 깊은 구조에서도 안정적인 학습을 가능하게 하였다. 그중에서도 ResNet50 모델은 50개의 층으로 구성되어 있으며, 깊은 네트워크 구조에도 불구하고 우수한 성능과 효율적인 학습을 동시에 이루었다.
 
-EfficientNet은 2019년 구글에서 제안한 모델로, CNN의 성능을 높이기 위한 새로운 접근 방식을 제시하였다. 이 모델은 네트워크의 깊이(depth), 너비(width), 해상도(resolution)를 균형 있게 확장하는 복합 스케일링(Compound Scaling) 기법을 활용하여, 효율적이면서도 높은 정확도를 달성하였다. EfficientNet은 특히 파라미터 수와 연산 비용이 적은 상태에서도 우수한 성능을 제공하여 다양한 이미지 분류 태스크에서 널리 사용되고 있다.
-
 마지막으로 Swin Transformer는 2021년 마이크로소프트에서 발표한 최신 모델로, 기존의 CNN과 달리 Transformer의 셀프 어텐션(self-attention)을 컴퓨터 비전에 적용하면서도 효율성을 높인 모델이다. Swin Transformer는 이미지를 작은 패치(patch) 단위로 나누고, 이러한 패치들을 윈도우(window) 단위로 그룹화하여 국소적인 셀프 어텐션(window-based self-attention)을 수행한다. 또한 윈도우를 점진적으로 이동(shifted window)시키는 방식으로 윈도우 간의 연결성을 확보하여 지역적 정보와 전역적 정보를 효율적으로 학습할 수 있게 한다. 이와 같은 설계로 인해 계산량은 줄이면서도 기존의 CNN 및 일반적인 Vision Transformer(ViT)에 비해 이미지 분류를 비롯한 다양한 비전 태스크에서 우수한 성능을 달성하였다.
 
 이번 프로젝트에서는 Image Classification 태스크의 주요 모델을 사용해보며 꽃 이미지 데이터셋의 다중 클래스 분류에 가장 적합한 모델을 탐색하고, 각 모델의 특징을 실습해보는 시간을 가졌다.
@@ -292,16 +290,79 @@ plt.show()
 ![image](https://github.com/user-attachments/assets/fd163968-eb50-4bd5-b2cd-70e795d158e3)
 
 
-### 바. ResNet50과 EfficientNet B0을 사용한 모델 학습 및 평가
+### 바. ResNet50과 파인튜닝을 사용한 모델 학습 및 평가 (MySQL DB 연동)
+**DB 연동을 위한 코드 추가**
+```python
+class MySQLLogger(tf.keras.callbacks.Callback):
+    def __init__(self, host, user, password, database, table_name):
+        super(MySQLLogger, self).__init__()
+        self.host = host
+        self.user = user
+        self.password = password
+        self.database = database
+        self.table_name = table_name
+        self.conn = None
+        self.cursor = None
 
-Fine-Tuned ResNet Validation Loss: 1.3396
-Fine-Tuned ResNet Validation Accuracy: 0.5624
+    def on_train_begin(self, logs=None):
+        try:
+            self.conn = mysql.connector.connect(
+                host=self.host,
+                user=self.user,
+                password=self.password,
+                database=self.database
+            )
+            self.cursor = self.conn.cursor()
+            # 테이블이 없으면 생성
+            create_table_query = f"""
+            CREATE TABLE IF NOT EXISTS {self.table_name} (
+                epoch INT PRIMARY KEY,
+                loss FLOAT,
+                accuracy FLOAT,
+                val_loss FLOAT,
+                val_accuracy FLOAT
+            )
+            """
+            self.cursor.execute(create_table_query)
+            self.conn.commit()
+            print("MySQL 연결 및 테이블 준비 완료")
+        except Error as e:
+            print("MySQL 연결 오류:", e)
 
-Fine-Tuned EfficientNet Validation Loss: 1.6076
-Fine-Tuned EfficientNet Validation Accuracy: 0.2354
+    def on_epoch_end(self, epoch, logs=None):
+        logs = logs or {}
+        loss = logs.get('loss')
+        accuracy = logs.get('accuracy')
+        val_loss = logs.get('val_loss')
+        val_accuracy = logs.get('val_accuracy')
 
-![image](https://github.com/user-attachments/assets/ac5bd395-4350-4153-b0b9-49bbe457541a)
+        insert_query = f"""
+        INSERT INTO {self.table_name} (epoch, loss, accuracy, val_loss, val_accuracy)
+        VALUES (%s, %s, %s, %s, %s)
+        """
+        data = (epoch + 1, loss, accuracy, val_loss, val_accuracy)
+        try:
+            self.cursor.execute(insert_query, data)
+            self.conn.commit()
+            print(f"Epoch {epoch+1} 데이터 저장 완료")
+        except Error as e:
+            print("데이터 저장 오류:", e)
 
+    def on_train_end(self, logs=None):
+        if self.cursor:
+            self.cursor.close()
+        if self.conn:
+            self.conn.close()
+        print("MySQL 연결 종료")
+```
+**ResNet50 파인 튜닝 진행**
+- Phase 1 학습: 베이스 전체 동결 상태에서 학습
+- Phase 2 학습: 일부 레이어 Unfreeze 및 학습률 감소
+
+**결과 시각화**
+![image](https://github.com/user-attachments/assets/786120f9-e37a-4d85-866d-83acca0eb037)
+Final Validation Loss: 1.1435
+Final Validation Accuracy: 0.5474
 
 ### 사. Swin Transformer (CNN + Transformer)를 사용한 모델 학습 및 평가
 
